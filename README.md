@@ -64,6 +64,8 @@ This solution is also published on my GitHub account created specifically for th
 
 The repository contains the same submission and documentation, with an additional note specific to that account.
 
+## Leaderboard
+
 ![SWARM Challenge leaderboard](leaderboard.png)
 
 > Final leaderboard result: **131st place** out of nearly **27,000 submissions**, with a score of **283/1000**.
