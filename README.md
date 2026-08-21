@@ -63,3 +63,7 @@ This solution is also published on my GitHub account created specifically for th
 [Garage4245/Ant-Colony-Challenge](https://github.com/Garage4245/Ant-Colony-Challenge)
 
 The repository contains the same submission and documentation, with an additional note specific to that account.
+
+![SWARM Challenge leaderboard](leaderboard.png)
+
+> Final leaderboard result: **131st place** out of nearly **27,000 submissions**, with a score of **277/1000**.
