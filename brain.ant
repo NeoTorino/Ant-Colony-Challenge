@@ -1,0 +1,721 @@
+; ╔══════════════════════════════════════════════════════════════════╗
+; ║  SWARM v41  —  Ant Colony Foraging Program                      ║
+; ║                                                                  ║
+; ║  STRATEGY OVERVIEW                                              ║
+; ║                                                                  ║
+; ║  200 ants share this program. On initialisation each ant is     ║
+; ║  assigned a role and a primary/secondary travel direction        ║
+; ║  based on its ID, spreading the colony across the grid.         ║
+; ║                                                                  ║
+; ║  ROLES (ID mod 10)                                              ║
+; ║    0        → drone   (10% of colony, ~20 ants)                 ║
+; ║    1-9      → worker  (90% of colony, ~180 ants)                ║
+; ║                                                                  ║
+; ║  WORKER: standard forager. Follows FOOD_TRAIL toward food,      ║
+; ║  picks it up, and returns it to the nest, reinforcing the       ║
+; ║  trail on the way home.                                         ║
+; ║                                                                  ║
+; ║  DRONE: explorer. Never picks up food. When food is sensed      ║
+; ║  adjacent, marks the current cell as FOOD_TRAIL at manhattan    ║
+; ║  distance (same gradient as workers) and continues exploring.   ║
+; ║  This signals to workers that food lies nearby without the      ║
+; ║  drone leaving the field. Drone trail marks that no worker      ║
+; ║  reinforces will decay naturally, keeping the grid clean.       ║
+; ║                                                                  ║
+; ║  PHEROMONE CHANNELS                                             ║
+; ║    CH_RED  (FOOD_TRAIL)  — laid by returning workers and by     ║
+; ║                            drones when food is sensed. Each     ║
+; ║                            cell is topped up to exactly its     ║
+; ║                            manhattan distance from the nest.    ║
+; ║                            Before marking, the current          ║
+; ║                            intensity is SNIFFed; only the       ║
+; ║                            deficit (target − current) is added, ║
+; ║                            so the value never exceeds the       ║
+; ║                            correct gradient level regardless    ║
+; ║                            of how many ants pass through.       ║
+; ║                            Searching ants follow SMELL outward  ║
+; ║                            (ascending gradient = toward food).  ║
+; ║    CH_BLUE (HOME_TRAIL)  — laid by searching ants at intensity  ║
+; ║                            = 255 − distance. Gradient points    ║
+; ║                            toward the nest; used by the         ║
+; ║                            wall-follower to choose CW/CCW.      ║
+; ║    CH_GREEN (LOOP_TRAIL) — temporary breadcrumb laid at 60 on   ║
+; ║                            every cell walked during wall-follow.║
+; ║                            Before each wall-follow move the     ║
+; ║                            target cell is SNIFFed; intensity    ║
+; ║                            > 30 means the cell was visited this ║
+; ║                            traversal — skip that option and try ║
+; ║                            the next, breaking L-corner loops.   ║
+; ║                            Walls cannot hold pheromone, so      ║
+; ║                            SNIFF on a wall cell always returns  ║
+; ║                            0 and never causes a false skip.     ║
+; ║                                                                  ║
+; ║  HOMING (Bug2 wall-follow)                                      ║
+; ║    Direct mode: tries primary dir, then secondary, then starts  ║
+; ║    wall-follow. CW/CCW chosen by comparing HOME_TRAIL intensity ║
+; ║    on each side. Wall-follow exits when manhattan distance drops ║
+; ║    below the value recorded at entry and the primary dir is     ║
+; ║    clear, resuming direct mode.                                 ║
+; ║                                                                  ║
+; ╚══════════════════════════════════════════════════════════════════╝
+
+.alias dx        r1
+.alias dy        r2
+.alias ret       r3
+.alias role      r4
+.alias primary   r5
+.alias secondary r6
+.alias saved_h   r7
+
+.const FOOD_TRAIL CH_RED
+.const HOME_TRAIL CH_BLUE
+.const LOOP_TRAIL CH_GREEN
+
+.tag 0 worker
+.tag 1 drone
+
+JMP main
+
+; ════════════════════════════════════════════════════════════════════
+; SUBROUTINE: move_and_track
+; Move in direction r0. Update dx/dy. Swap primary/secondary so the
+; ant alternates between its two preferred directions each step.
+; ════════════════════════════════════════════════════════════════════
+move_and_track:
+    SET saved_h primary
+    SET primary secondary
+    SET secondary saved_h
+    JEQ r0 1 mat_n
+    JEQ r0 2 mat_e
+    JEQ r0 3 mat_s
+    SUB dx 1
+    MOVE r0
+    JMP ret
+mat_n:
+    SUB dy 1
+    MOVE r0
+    JMP ret
+mat_e:
+    ADD dx 1
+    MOVE r0
+    JMP ret
+mat_s:
+    ADD dy 1
+    MOVE r0
+    JMP ret
+
+; ════════════════════════════════════════════════════════════════════
+; SUBROUTINE: move_home
+; Move in direction r0 and update dx/dy. No primary/secondary swap.
+; ════════════════════════════════════════════════════════════════════
+move_home:
+    JEQ r0 1 mh_n
+    JEQ r0 2 mh_e
+    JEQ r0 3 mh_s
+    SUB dx 1
+    MOVE r0
+    JMP ret
+mh_n:
+    SUB dy 1
+    MOVE r0
+    JMP ret
+mh_e:
+    ADD dx 1
+    MOVE r0
+    JMP ret
+mh_s:
+    ADD dy 1
+    MOVE r0
+    JMP ret
+
+; ════════════════════════════════════════════════════════════════════
+; SUBROUTINE: home_intensity_val
+; Returns max(0, 255 − manhattan_distance). Used to mark HOME_TRAIL:
+; high intensity near the nest, low intensity far away.
+; ════════════════════════════════════════════════════════════════════
+home_intensity_val:
+    SET saved_h dx
+    JGT dx 0 hiv_dx_pos
+    SET saved_h 0
+    SUB saved_h dx
+hiv_dx_pos:
+    SET r0 dy
+    JGT dy 0 hiv_dy_pos
+    SET r0 0
+    SUB r0 dy
+hiv_dy_pos:
+    ADD r0 saved_h
+    SET saved_h r0
+    SET r0 255
+    SUB r0 saved_h
+    JGT r0 0 hiv_done
+    SET r0 0
+hiv_done:
+    JMP ret
+
+; ════════════════════════════════════════════════════════════════════
+; SUBROUTINE: manhattan_dist_val
+; Returns |dx| + |dy|. Used as the target intensity for FOOD_TRAIL:
+; high far from the nest, low near it, so the gradient slopes upward
+; toward food and searching ants follow SMELL outward correctly.
+; ════════════════════════════════════════════════════════════════════
+manhattan_dist_val:
+    SET saved_h dx
+    JGT dx 0 mdv_dx_pos
+    SET saved_h 0
+    SUB saved_h dx
+mdv_dx_pos:
+    SET r0 dy
+    JGT dy 0 mdv_dy_pos
+    SET r0 0
+    SUB r0 dy
+mdv_dy_pos:
+    ADD r0 saved_h
+    JMP ret
+
+; ════════════════════════════════════════════════════════════════════
+; SUBROUTINE: home_primary_dir
+; Returns the cardinal direction (1-4) with the larger displacement
+; component. Ties favour horizontal. Used as the direct-mode heading.
+; ════════════════════════════════════════════════════════════════════
+home_primary_dir:
+    SET saved_h dx
+    JGT dx 0 hpd_dxpos
+    SET saved_h 0
+    SUB saved_h dx
+hpd_dxpos:
+    SET r0 dy
+    JGT dy 0 hpd_dypos
+    SET r0 0
+    SUB r0 dy
+hpd_dypos:
+    JGT r0 saved_h hpd_vert
+    JGT dx 0 hpd_w
+    SET r0 2
+    JMP ret
+hpd_w:
+    SET r0 4
+    JMP ret
+hpd_vert:
+    JGT dy 0 hpd_n
+    SET r0 3
+    JMP ret
+hpd_n:
+    SET r0 1
+    JMP ret
+
+; ════════════════════════════════════════════════════════════════════
+; SUBROUTINE: home_secondary_dir
+; Returns the cardinal direction with the smaller displacement
+; component (the cross-axis). Used as the fallback heading.
+; ════════════════════════════════════════════════════════════════════
+home_secondary_dir:
+    SET saved_h dx
+    JGT dx 0 hsd_dxpos
+    SET saved_h 0
+    SUB saved_h dx
+hsd_dxpos:
+    SET r0 dy
+    JGT dy 0 hsd_dypos
+    SET r0 0
+    SUB r0 dy
+hsd_dypos:
+    JGT r0 saved_h hsd_vert
+    JGT dy 0 hsd_h_n
+    JEQ dy 0 hsd_zero
+    SET r0 3
+    JMP ret
+hsd_h_n:
+    SET r0 1
+    JMP ret
+hsd_vert:
+    JGT dx 0 hsd_v_w
+    JEQ dx 0 hsd_zero
+    SET r0 2
+    JMP ret
+hsd_v_w:
+    SET r0 4
+    JMP ret
+hsd_zero:
+    SET r0 2
+    JMP ret
+
+; ════════════════════════════════════════════════════════════════════
+; SUBROUTINE: opposite_4dir
+; Returns the direction directly opposite to r0 (N↔S, E↔W).
+; ════════════════════════════════════════════════════════════════════
+opposite_4dir:
+    SUB r0 1
+    ADD r0 2
+    MOD r0 4
+    ADD r0 1
+    JMP ret
+
+; ════════════════════════════════════════════════════════════════════
+; SUBROUTINE: cw_of
+; Returns the clockwise neighbour of direction r0 (N→E→S→W→N).
+; ════════════════════════════════════════════════════════════════════
+cw_of:
+    MOD r0 4
+    ADD r0 1
+    JMP ret
+
+; ════════════════════════════════════════════════════════════════════
+; SUBROUTINE: ccw_of
+; Returns the counter-clockwise neighbour of direction r0.
+; ════════════════════════════════════════════════════════════════════
+ccw_of:
+    ADD r0 2
+    MOD r0 4
+    ADD r0 1
+    JMP ret
+
+; ════════════════════════════════════════════════════════════════════
+; SUBROUTINE: gh_try_move
+; Attempt to move in direction saved_h. Updates dx/dy on success.
+; Returns r0=1 if moved, r0=0 if the cell is a wall.
+; ════════════════════════════════════════════════════════════════════
+gh_try_move:
+    PROBE saved_h r0
+    JEQ r0 1 gh_try_blocked
+    JEQ saved_h 1 gh_try_n
+    JEQ saved_h 2 gh_try_e
+    JEQ saved_h 3 gh_try_s
+    SUB dx 1
+    MOVE saved_h
+    SET r0 1
+    JMP ret
+gh_try_n:
+    SUB dy 1
+    MOVE saved_h
+    SET r0 1
+    JMP ret
+gh_try_e:
+    ADD dx 1
+    MOVE saved_h
+    SET r0 1
+    JMP ret
+gh_try_s:
+    ADD dy 1
+    MOVE saved_h
+    SET r0 1
+    JMP ret
+gh_try_blocked:
+    SET r0 0
+    JMP ret
+
+; ════════════════════════════════════════════════════════════════════
+; MAIN LOOP
+; On first entry (role==0) assign role and initial direction from ID.
+; ID mod 10 == 0 → drone (~10%). All others → worker (~90%).
+; Then branch on carrying status.
+; ════════════════════════════════════════════════════════════════════
+main:
+    JNE role 0 main_check_carry
+    ID r0
+    MOD r0 10
+    JEQ r0 0 setup_drone
+    SET role 1
+    JMP setup_dir
+setup_drone:
+    SET role 2
+setup_dir:
+    CALL ret assign_dir_from_id
+
+main_check_carry:
+    CARRYING r0
+    JNE r0 0 go_home
+
+main_mark_blue:
+    CALL ret home_intensity_val
+    MARK HOME_TRAIL r0
+    SENSE FOOD r0
+    JEQ r0 0 search_move
+    ; Food sensed adjacent. Drones mark and keep exploring.
+    ; Workers grab the food and head home.
+    JEQ role 2 drone_mark_food
+    JMP grab_food
+
+; ════════════════════════════════════════════════════════════════════
+; DRONE MARK FOOD
+; A drone has sensed food but does not pick it up. It marks the
+; current cell as FOOD_TRAIL at manhattan distance using the same
+; deficit top-up logic as returning workers, signalling to any worker
+; crossing this path that food lies nearby. It then re-senses food
+; to get the direction and immediately moves the opposite way,
+; escaping the food region as fast as possible to continue exploring
+; new areas of the grid. Adjacent food cells will be discovered
+; naturally by workers following the trail signal.
+; ════════════════════════════════════════════════════════════════════
+drone_mark_food:
+    CALL ret manhattan_dist_val
+    SNIFF FOOD_TRAIL HERE saved_h
+    JGT saved_h r0 dmf_move
+    JEQ saved_h r0 dmf_move
+    SUB r0 saved_h
+    MARK FOOD_TRAIL r0
+dmf_move:
+    SENSE FOOD r0
+    JEQ r0 0 search_move
+    CALL ret opposite_4dir
+    SET primary r0
+    SET secondary r0
+    CALL ret move_and_track
+    JMP main
+
+; ════════════════════════════════════════════════════════════════════
+; SEARCH MOVE
+; Workers follow FOOD_TRAIL via SMELL, which returns the direction
+; of the strongest adjacent red mark. Because returning workers mark
+; with manhattan distance (high far from nest, low near it), SMELL
+; always points the searcher outward toward food — gradient ascent.
+; Drones skip SMELL entirely and walk their assigned primary/secondary
+; pair direction, maximising grid coverage. If primary is blocked,
+; both roles bounce off HOME_TRAIL to find a detour, or pick a new
+; random pair.
+; ════════════════════════════════════════════════════════════════════
+search_move:
+    JEQ role 2 sm_drone
+    TAG worker
+    SMELL FOOD_TRAIL r0
+    JEQ r0 0 sm_pair
+    SET primary r0
+    SET secondary r0
+    CALL ret move_and_track
+    JMP main
+sm_drone:
+    TAG drone
+    JMP sm_pair
+sm_pair:
+    PROBE primary r0
+    JNE r0 1 sm_step
+    SMELL HOME_TRAIL r0
+    JEQ r0 0 sm_random
+    CALL ret opposite_4dir
+    SET saved_h r0
+    PROBE saved_h r0
+    JEQ r0 1 sm_random
+    SET primary saved_h
+    SET secondary saved_h
+    JMP sm_step
+sm_random:
+    SET r0 primary
+    CALL ret pick_new_pair
+    JMP search_move
+sm_step:
+    SET r0 primary
+    CALL ret move_and_track
+    JMP main
+
+; ════════════════════════════════════════════════════════════════════
+; GRAB FOOD
+; Move onto the food cell and pick up. Mark FOOD_TRAIL with the
+; manhattan distance from the nest, consistent with every other cell
+; on the trail. The same deficit top-up logic applies: read the
+; current intensity first and only add what is needed to reach the
+; target, never exceeding it. Reset primary/secondary so homing
+; recalculates direction from scratch on the next tick.
+; ════════════════════════════════════════════════════════════════════
+grab_food:
+    CALL ret move_and_track
+    PICKUP
+    CALL ret manhattan_dist_val
+    SNIFF FOOD_TRAIL HERE saved_h
+    JGT saved_h r0 gf_skip_mark
+    JEQ saved_h r0 gf_skip_mark
+    SUB r0 saved_h
+    MARK FOOD_TRAIL r0
+gf_skip_mark:
+    SET primary 0
+    SET secondary 0
+    JMP main
+
+; ════════════════════════════════════════════════════════════════════
+; GO HOME
+; Carries food back to the nest. On each cell, tops up FOOD_TRAIL to
+; exactly the manhattan distance value: reads current intensity first
+; and only adds the deficit, preserving the gradient regardless of
+; traffic density.
+; Uses Bug2 wall-following to navigate around obstacles.
+; primary==0  → direct mode
+; 1≤primary≤4 → clockwise wall-follow
+; primary>4   → counter-clockwise wall-follow (real heading = p−4)
+; ════════════════════════════════════════════════════════════════════
+go_home:
+    CALL ret manhattan_dist_val
+    MUL r0 2
+    SNIFF FOOD_TRAIL HERE saved_h
+    JGT saved_h r0 gh_skip_mark
+    JEQ saved_h r0 gh_skip_mark
+    SUB r0 saved_h
+    MARK FOOD_TRAIL r0
+gh_skip_mark:
+    SENSE NEST r0
+    JNE r0 0 gh_deliver
+    JEQ primary 0 gh_direct
+    JGT primary 4 gh_follow_ccw
+    JMP gh_follow_cw
+
+gh_direct:
+    CALL ret home_primary_dir
+    SET saved_h r0
+    CALL ret gh_try_move
+    JNE r0 0 gh_done
+    CALL ret home_secondary_dir
+    SET saved_h r0
+    CALL ret gh_try_move
+    JNE r0 0 gh_done
+    ; Both direct axes blocked — start wall-follow.
+    ; Record current distance as the Bug2 exit threshold.
+    ; Choose CW/CCW by comparing HOME_TRAIL intensity on each side.
+    CALL ret manhattan_dist_val
+    SET secondary r0
+    CALL ret home_primary_dir
+    SET primary r0
+    CALL ret cw_of
+    SNIFF HOME_TRAIL r0 saved_h
+    SET r0 primary
+    CALL ret ccw_of
+    SNIFF HOME_TRAIL r0 r0
+    JGT saved_h r0 gh_start_ccw
+gh_start_cw:
+    JMP gh_follow_cw
+gh_start_ccw:
+    ADD primary 4
+    JMP gh_follow_ccw
+
+; ════════════════════════════════════════════════════════════════════
+; WALL-FOLLOW CLOCKWISE
+; Tries four options in order: turn right, go straight, turn left,
+; turn back. Before options 1-3 the target cell is SNIFFed for
+; LOOP_TRAIL. Intensity > 30 means that cell was visited during this
+; wall-follow traversal; skip it to avoid L-corner loops.
+; Option 4 (turn back) has no SNIFF check and always attempts,
+; guaranteeing the ant can never be permanently stuck.
+; On a straight wall, option 1 targets the wall cell itself;
+; walls cannot hold pheromone so SNIFF returns 0 and no false skip
+; occurs.
+; Bug2 exit: when manhattan distance ≤ secondary and primary dir
+; is clear, revert to direct mode.
+; ════════════════════════════════════════════════════════════════════
+gh_follow_cw:
+    CALL ret manhattan_dist_val
+    JGT r0 secondary gh_cw_move
+    JEQ r0 secondary gh_cw_move
+    CALL ret home_primary_dir
+    SET saved_h r0
+    PROBE saved_h r0
+    JEQ r0 1 gh_cw_move
+    SET primary 0
+    SET secondary 0
+    JMP gh_direct
+
+gh_cw_move:
+    ; Option 1: turn right
+    SET r0 primary
+    CALL ret cw_of
+    SET saved_h r0
+    SNIFF LOOP_TRAIL saved_h r0
+    JGT r0 30 gh_cw_opt2
+    CALL ret gh_try_move
+    JEQ r0 1 gh_cw_moved
+
+gh_cw_opt2:
+    ; Option 2: go straight
+    SET saved_h primary
+    SNIFF LOOP_TRAIL saved_h r0
+    JGT r0 30 gh_cw_opt3
+    CALL ret gh_try_move
+    JEQ r0 1 gh_cw_moved
+
+gh_cw_opt3:
+    ; Option 3: turn left
+    SET r0 primary
+    CALL ret ccw_of
+    SET saved_h r0
+    SNIFF LOOP_TRAIL saved_h r0
+    JGT r0 30 gh_cw_opt4
+    CALL ret gh_try_move
+    JEQ r0 1 gh_cw_moved
+
+gh_cw_opt4:
+    ; Option 4: turn back — safety valve, no SNIFF check
+    SET r0 primary
+    CALL ret opposite_4dir
+    SET saved_h r0
+    CALL ret gh_try_move
+    JEQ r0 1 gh_cw_moved
+    JMP gh_done
+
+gh_cw_moved:
+    SET primary saved_h
+    MARK LOOP_TRAIL 60
+    JMP gh_done
+
+; ════════════════════════════════════════════════════════════════════
+; WALL-FOLLOW COUNTER-CLOCKWISE
+; Mirror of CW. Real heading = primary − 4.
+; Same SNIFF-before-move logic applied to all three forward options.
+; ════════════════════════════════════════════════════════════════════
+gh_follow_ccw:
+    CALL ret manhattan_dist_val
+    JGT r0 secondary gh_ccw_move
+    JEQ r0 secondary gh_ccw_move
+    CALL ret home_primary_dir
+    SET saved_h r0
+    PROBE saved_h r0
+    JEQ r0 1 gh_ccw_move
+    SET primary 0
+    SET secondary 0
+    JMP gh_direct
+
+gh_ccw_move:
+    ; Option 1: turn left
+    SET r0 primary
+    SUB r0 4
+    CALL ret ccw_of
+    SET saved_h r0
+    SNIFF LOOP_TRAIL saved_h r0
+    JGT r0 30 gh_ccw_opt2
+    CALL ret gh_try_move
+    JEQ r0 1 gh_ccw_moved
+
+gh_ccw_opt2:
+    ; Option 2: go straight
+    SET saved_h primary
+    SUB saved_h 4
+    SNIFF LOOP_TRAIL saved_h r0
+    JGT r0 30 gh_ccw_opt3
+    CALL ret gh_try_move
+    JEQ r0 1 gh_ccw_moved
+
+gh_ccw_opt3:
+    ; Option 3: turn right
+    SET r0 primary
+    SUB r0 4
+    CALL ret cw_of
+    SET saved_h r0
+    SNIFF LOOP_TRAIL saved_h r0
+    JGT r0 30 gh_ccw_opt4
+    CALL ret gh_try_move
+    JEQ r0 1 gh_ccw_moved
+
+gh_ccw_opt4:
+    ; Option 4: turn back — safety valve, no SNIFF check
+    SET r0 primary
+    SUB r0 4
+    CALL ret opposite_4dir
+    SET saved_h r0
+    CALL ret gh_try_move
+    JEQ r0 1 gh_ccw_moved
+    JMP gh_done
+
+gh_ccw_moved:
+    SET primary saved_h
+    ADD primary 4
+    MARK LOOP_TRAIL 60
+    JMP gh_done
+
+gh_done:
+    JMP main
+
+; ════════════════════════════════════════════════════════════════════
+; DELIVER
+; Move onto nest cell, drop food, reset position tracking and
+; re-assign travel direction for the next foraging run.
+; ════════════════════════════════════════════════════════════════════
+gh_deliver:
+    MARK HOME_TRAIL 255
+    CALL ret move_home
+    DROP
+    SET dx 0
+    SET dy 0
+    CALL ret assign_dir_from_id
+    JMP main
+
+; ════════════════════════════════════════════════════════════════════
+; SUBROUTINE: assign_dir_from_id
+; Spreads ants across 6 directional sectors based on ID mod 6.
+; 0=W  1=E  2=NW  3=NE  4=SW  5=SE
+; ════════════════════════════════════════════════════════════════════
+assign_dir_from_id:
+    ID r0
+    MOD r0 6
+    JEQ r0 0 adf_w
+    JEQ r0 1 adf_e
+    JEQ r0 2 adf_nw
+    JEQ r0 3 adf_ne
+    JEQ r0 4 adf_sw
+    SET primary 3
+    SET secondary 2
+    JMP ret
+adf_w:
+    SET primary 4
+    SET secondary 4
+    JMP ret
+adf_e:
+    SET primary 2
+    SET secondary 2
+    JMP ret
+adf_nw:
+    SET primary 1
+    SET secondary 4
+    JMP ret
+adf_ne:
+    SET primary 1
+    SET secondary 2
+    JMP ret
+adf_sw:
+    SET primary 3
+    SET secondary 4
+    JMP ret
+
+; ════════════════════════════════════════════════════════════════════
+; SUBROUTINE: pick_new_pair
+; Picks a random direction pair that differs from both r0 (the
+; current primary) and its opposite, preventing the ant from
+; selecting the same stuck direction again.
+; ════════════════════════════════════════════════════════════════════
+pick_new_pair:
+    SET saved_h r0
+    SUB r0 1
+    ADD r0 2
+    MOD r0 4
+    ADD r0 1
+pnp_roll:
+    RANDOM secondary 6
+    JEQ secondary 0 pnp_w
+    JEQ secondary 1 pnp_e
+    JEQ secondary 2 pnp_nw
+    JEQ secondary 3 pnp_ne
+    JEQ secondary 4 pnp_sw
+    SET primary 3
+    SET secondary 2
+    JMP pnp_check
+pnp_w:
+    SET primary 4
+    SET secondary 4
+    JMP pnp_check
+pnp_e:
+    SET primary 2
+    SET secondary 2
+    JMP pnp_check
+pnp_nw:
+    SET primary 1
+    SET secondary 4
+    JMP pnp_check
+pnp_ne:
+    SET primary 1
+    SET secondary 2
+    JMP pnp_check
+pnp_sw:
+    SET primary 3
+    SET secondary 4
+pnp_check:
+    JNE primary saved_h pnp_not_wall
+    JEQ secondary saved_h pnp_roll
+pnp_not_wall:
+    JNE primary r0 pnp_accept
+    JEQ secondary r0 pnp_roll
+pnp_accept:
+    JMP ret
