@@ -10,7 +10,7 @@ The same program runs on every ant. The only differences between them come from 
 
 - **Username:** Garage4245
 - **Score:** **283 / 1000**
-- **Ranking:** **131st** out of nearly **27,000 submissions**
+- **Ranking:** **131st** out of nearly **30,000 submissions**
 
 ## The Challenge
 
